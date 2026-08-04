@@ -183,7 +183,23 @@ for shell_config in "$HOME/.bashrc" "$HOME/.zshrc"; do
     fi
 done
 
-validate "cluster reachable" "kubectl cluster-info &>/dev/null"
+# Retry for up to 60s — nvidia GPU operator install can briefly churn the API server,
+# and standalone kubectl isn't installed until Step 6 so fall back to microk8s kubectl.
+echo -e "${YELLOW}  🔍 Validating: cluster reachable (retrying up to 60s)${NC}"
+CLUSTER_OK=0
+for i in $(seq 1 12); do
+    if kubectl cluster-info &>/dev/null 2>&1 || sudo microk8s kubectl cluster-info &>/dev/null 2>&1; then
+        echo -e "${GREEN}  ✓ Validated${NC}"
+        CLUSTER_OK=1
+        break
+    fi
+    echo -e "${YELLOW}  ⏳ API server not ready yet, retrying ($i/12)...${NC}"
+    sleep 5
+done
+if [ "$CLUSTER_OK" -eq 0 ]; then
+    echo -e "${RED}  ✗ Validation failed: cluster reachable${NC}"
+    exit 1
+fi
 
 # =============================================================================
 # Step 4: Dynamo env vars
