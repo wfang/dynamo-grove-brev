@@ -1,7 +1,70 @@
 #!/bin/bash
-set -e
+# =============================================================================
+# Dynamo on Brev - Idempotent cluster setup
+#
+# Intended for Brev oncreate lifecycle (curl | bash), often as root.
+# Safe to re-run: each step checks before acting.
+#
+# Idempotency / failure-hardening ideas adapted from woodgaines
+# (https://github.com/mjhermanson-nv/dynamo-grove-brev/pull/1).
+# =============================================================================
+
+set -euo pipefail
+
+# --- Colors / step helpers ---------------------------------------------------
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+step_num=0
+
+# Print a numbered step banner.
+# Input: human-readable step title
+step() {
+    step_num=$((step_num + 1))
+    echo ""
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${CYAN}  Step $step_num: $1${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+}
+
+# Echo then run a command (so logs show what executed).
+# Input: command + args
+run() {
+    echo -e "${YELLOW}  ▶ $*${NC}"
+    "$@"
+}
+
+# Mark a step as already satisfied.
+# Input: short reason string
+skip() {
+    echo -e "${GREEN}  ✓ Already done: $1${NC}"
+}
+
+# Fail the script if a check command exits non-zero.
+# Input: $1 description, $2 shell expression to evaluate
+validate() {
+    echo -e "${YELLOW}  🔍 Validating: $1${NC}"
+    if eval "$2"; then
+        echo -e "${GREEN}  ✓ Validated${NC}"
+    else
+        echo -e "${RED}  ✗ Validation failed: $1${NC}"
+        exit 1
+    fi
+}
+
+# When lifecycle runs as root, chown paths back to the Brev user.
+# Input: one or more filesystem paths
+fix_owner() {
+    if [ "$(id -u)" -eq 0 ]; then
+        chown -R "$USER:$USER" "$@"
+    fi
+}
 
 # Detect Brev user (handles ubuntu, nvidia, shadeform, etc.)
+# Returns: username on stdout
 detect_brev_user() {
     if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
         echo "$SUDO_USER"
@@ -22,69 +85,113 @@ detect_brev_user() {
     echo "ubuntu"
 }
 
+# Brev oncreate often invokes this as root; remap HOME/USER to the instance user
+# so kubeconfig and shell rc updates land in the right place.
 if [ "$(id -u)" -eq 0 ] || [ "${USER:-}" = "root" ]; then
     DETECTED_USER=$(detect_brev_user)
     export USER="$DETECTED_USER"
     export HOME="/home/$DETECTED_USER"
 fi
 
+export RELEASE_VERSION="${RELEASE_VERSION:-0.7.1}"
+export NAMESPACE="${NAMESPACE:-dynamo}"
+export CACHE_PATH="${CACHE_PATH:-/data/huggingface-cache}"
+
 echo "☸️  Setting up Kubernetes with Dynamo..."
-echo "User: $USER"
+echo "User: $USER  HOME: $HOME"
 
-# Install microk8s
-echo "Installing microk8s..."
-sudo snap install microk8s --classic
+# =============================================================================
+# Step 1: microk8s
+# =============================================================================
+step "Install microk8s"
 
-# Add user to group
-sudo usermod -a -G microk8s $USER
-
-# Create .kube directory if it doesn't exist and fix permissions
-mkdir -p ~/.kube
-if [ "$(id -u)" -eq 0 ]; then
-    chown -R $USER:$USER ~/.kube
+if snap list microk8s &>/dev/null; then
+    skip "microk8s is installed"
+else
+    run sudo snap install microk8s --classic
 fi
 
-# Wait for microk8s to be ready
-echo "Waiting for microk8s..."
+if ! groups "$USER" | grep -q microk8s; then
+    run sudo usermod -a -G microk8s "$USER"
+else
+    skip "$USER is in microk8s group"
+fi
+
+# Brev bootstrap sometimes writes disabled_plugins = ["cri"] into containerd
+# configs. That URI is invalid on current containerd and prevents microk8s from
+# becoming ready. Strip it if present, then restart containerd only when needed.
+if grep -q 'disabled_plugins.*"cri"' /var/snap/microk8s/*/args/containerd.toml 2>/dev/null || \
+   grep -q 'disabled_plugins.*"cri"' /var/snap/microk8s/*/args/containerd-template.toml 2>/dev/null; then
+    echo -e "${YELLOW}  ⚠ Fixing corrupted containerd config (removing invalid 'cri' plugin entry)${NC}"
+    sudo sed -i '/disabled_plugins.*cri/d' /var/snap/microk8s/*/args/containerd.toml 2>/dev/null || true
+    sudo sed -i '/disabled_plugins.*cri/d' /var/snap/microk8s/*/args/containerd-template.toml 2>/dev/null || true
+    if [ -f /etc/containerd/config.toml ] && grep -q 'disabled_plugins.*"cri"' /etc/containerd/config.toml; then
+        sudo bash -c 'echo "version = 2" > /etc/containerd/config.toml'
+    fi
+    sudo systemctl reset-failed snap.microk8s.daemon-containerd 2>/dev/null || true
+    sudo systemctl restart snap.microk8s.daemon-containerd
+    sleep 5
+fi
+
+echo -e "${YELLOW}  ▶ sudo microk8s status --wait-ready${NC}"
 sudo microk8s status --wait-ready
+validate "microk8s is running" "sudo microk8s status | grep -q 'microk8s is running'"
 
-# Enable essential addons
-echo "Enabling addons..."
-sudo microk8s enable dns
-sudo microk8s enable nvidia  # NVIDIA GPU operator (Brev has NVIDIA drivers)
-sudo microk8s enable dashboard  # Kubernetes Dashboard UI
+# =============================================================================
+# Step 2: addons (dns + nvidia; skip Kubernetes Dashboard)
+# Dashboard is deprecated upstream, not used by the labs, and the wait path on
+# main broke when microk8s moved it out of kube-system.
+# =============================================================================
+step "Enable microk8s addons (dns, nvidia)"
 
-# Export kubeconfig so kubectl works without group membership
-echo "Configuring kubectl access..."
-sudo microk8s config > ~/.kube/config
-chmod 600 ~/.kube/config
-
-# Fix ownership if running as root
-if [ "$(id -u)" -eq 0 ]; then
-    chown $USER:$USER ~/.kube/config
+if sudo microk8s status --addon dns 2>&1 | grep -q "enabled"; then
+    skip "dns addon enabled"
+else
+    run sudo microk8s enable dns
 fi
 
-# Add KUBECONFIG to shell configs if not already there
-for shell_config in ~/.bashrc ~/.zshrc; do
-    if [ -f "$shell_config" ] && ! grep -q "KUBECONFIG.*kube/config" "$shell_config"; then
-        echo "" >> "$shell_config"
-        echo "# Kubernetes config" >> "$shell_config"
-        echo "export KUBECONFIG=\$HOME/.kube/config" >> "$shell_config"
+if sudo microk8s status --addon nvidia 2>&1 | grep -q "enabled"; then
+    skip "nvidia addon enabled"
+else
+    run sudo microk8s enable nvidia
+fi
 
-        # Fix ownership if running as root
-        if [ "$(id -u)" -eq 0 ]; then
-            chown $USER:$USER "$shell_config"
-        fi
+validate "dns addon enabled" "sudo microk8s status --addon dns 2>&1 | grep -q 'enabled'"
+validate "nvidia addon enabled" "sudo microk8s status --addon nvidia 2>&1 | grep -q 'enabled'"
+
+# =============================================================================
+# Step 3: kubeconfig (always refresh so partial runs do not leave a stale file)
+# =============================================================================
+step "Configure kubeconfig"
+
+mkdir -p "$HOME/.kube"
+echo -e "${YELLOW}  ▶ sudo microk8s config > ~/.kube/config${NC}"
+sudo microk8s config > "$HOME/.kube/config"
+chmod 600 "$HOME/.kube/config"
+fix_owner "$HOME/.kube"
+
+export KUBECONFIG="$HOME/.kube/config"
+
+for shell_config in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    if [ -f "$shell_config" ] && ! grep -q "KUBECONFIG.*kube/config" "$shell_config"; then
+        {
+            echo ""
+            echo "# Kubernetes config"
+            echo 'export KUBECONFIG=$HOME/.kube/config'
+        } >> "$shell_config"
+        fix_owner "$shell_config"
     fi
 done
 
-# Export for current session
-export KUBECONFIG=$HOME/.kube/config
+validate "cluster reachable" "kubectl cluster-info &>/dev/null"
 
-# Set default NVIDIA Dynamo environment variables
-echo "Setting up Dynamo environment variables..."
-for shell_config in ~/.bashrc ~/.zshrc; do
-    if [ -f "$shell_config" ] && ! grep -q "DYNAMO" "$shell_config"; then
+# =============================================================================
+# Step 4: Dynamo env vars
+# =============================================================================
+step "Set Dynamo environment variables"
+
+for shell_config in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    if [ -f "$shell_config" ] && ! grep -q "DYNAMO\|RELEASE_VERSION" "$shell_config"; then
         cat >> "$shell_config" <<'DYNAMO_ENV'
 
 # NVIDIA Dynamo configuration
@@ -92,105 +199,157 @@ export RELEASE_VERSION="0.7.1"
 export NAMESPACE="dynamo"
 export CACHE_PATH="/data/huggingface-cache"
 DYNAMO_ENV
-        if [ "$(id -u)" -eq 0 ]; then
-            chown $USER:$USER "$shell_config"
-        fi
+        fix_owner "$shell_config"
+    else
+        [ -f "$shell_config" ] && skip "Dynamo vars already in $(basename "$shell_config")"
     fi
 done
 
-# Export for current session
-export RELEASE_VERSION="0.7.1"
-export NAMESPACE="dynamo"
-export CACHE_PATH="/data/huggingface-cache"
+validate "RELEASE_VERSION is set" '[ -n "$RELEASE_VERSION" ]'
 
-# Create cache directory if it doesn't exist
-sudo mkdir -p /data/huggingface-cache
-sudo chmod 777 /data/huggingface-cache
+# =============================================================================
+# Step 5: Hugging Face cache dir
+# =============================================================================
+step "Create cache directory"
 
-# Remove any existing snap alias (it requires group membership)
+if [ -d "$CACHE_PATH" ]; then
+    skip "$CACHE_PATH exists"
+else
+    run sudo mkdir -p "$CACHE_PATH"
+fi
+# World-writable so notebook / container users can share the HF cache volume.
+run sudo chmod 777 "$CACHE_PATH"
+validate "cache dir writable" "[ -w \"$CACHE_PATH\" ]"
+
+# =============================================================================
+# Step 6: standalone kubectl (fallback to microk8s binary on download failure)
+# =============================================================================
+step "Install standalone kubectl"
+
 sudo snap unalias kubectl 2>/dev/null || true
 
-# Install standalone kubectl (works without group membership!)
-echo "Installing standalone kubectl..."
-KUBECTL_VERSION=$(curl -fsSL https://dl.k8s.io/release/stable.txt | head -n 1 | tr -d '\r\n')
-if [ -z "$KUBECTL_VERSION" ] || ! echo "$KUBECTL_VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-    echo "Unexpected kubectl version: $KUBECTL_VERSION" >&2
-    exit 1
+if [ -x /usr/local/bin/kubectl ]; then
+    skip "kubectl at /usr/local/bin/kubectl"
+else
+    KUBECTL_VERSION=$(curl -fsSL --connect-timeout 10 --max-time 30 https://dl.k8s.io/release/stable.txt 2>/dev/null | head -n 1 | tr -d '\r\n') || true
+    if [ -z "$KUBECTL_VERSION" ] || ! echo "$KUBECTL_VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+        echo -e "${YELLOW}  ⚠ Could not determine kubectl version, falling back to microk8s symlink${NC}"
+        run sudo ln -sf /snap/microk8s/current/kubectl /usr/local/bin/kubectl
+    elif ! curl -fsSL --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 5 \
+        "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" -o /tmp/kubectl 2>/dev/null; then
+        echo -e "${YELLOW}  ⚠ Download failed, falling back to microk8s symlink${NC}"
+        run sudo ln -sf /snap/microk8s/current/kubectl /usr/local/bin/kubectl
+    else
+        run chmod +x /tmp/kubectl
+        run sudo mv /tmp/kubectl /usr/local/bin/kubectl
+    fi
 fi
-curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" -o /tmp/kubectl
-chmod +x /tmp/kubectl
-sudo mv /tmp/kubectl /usr/local/bin/kubectl
-echo "✓ kubectl installed to /usr/local/bin/kubectl"
 
-# Install standalone helm (works without group membership!)
-echo "Installing standalone helm..."
-curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-echo "✓ helm installed to /usr/local/bin/helm"
+validate "kubectl works" "kubectl version --client &>/dev/null"
 
-# Install k9s for terminal UI
-echo "Installing k9s..."
-cd /tmp
-wget -q https://github.com/derailed/k9s/releases/latest/download/k9s_Linux_amd64.tar.gz -O /tmp/k9s_Linux_amd64.tar.gz
-tar -xzf /tmp/k9s_Linux_amd64.tar.gz -C /tmp
-sudo chmod +x /tmp/k9s
-sudo mv /tmp/k9s /usr/local/bin/
-rm -f /tmp/k9s_Linux_amd64.tar.gz /tmp/LICENSE /tmp/README.md 2>/dev/null || true
-cd - > /dev/null
+# =============================================================================
+# Step 7: standalone helm
+# =============================================================================
+step "Install standalone helm"
 
-# Install uv (fast Python package installer)
-echo "Installing uv..."
-curl -LsSf https://astral.sh/uv/install.sh | sh
-# Add to PATH for current session
-export PATH="$HOME/.cargo/bin:$PATH"
-echo "✓ uv installed to ~/.cargo/bin/uv"
-
-# Install local-path-provisioner for PersistentVolumeClaims
-echo "Installing local-path storage provisioner..."
-kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.24/deploy/local-path-storage.yaml
-
-# Wait for provisioner to be ready
-echo "Waiting for storage provisioner..."
-kubectl wait --for=condition=available --timeout=60s deployment/local-path-provisioner -n local-path-storage
-
-# Set as default storage class
-kubectl patch storageclass local-path -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
-echo "✓ Storage provisioner installed and set as default"
-
-# Wait for Kubernetes Dashboard and save token
-echo "Waiting for Kubernetes Dashboard..."
-kubectl wait --for=condition=available --timeout=120s deployment/kubernetes-dashboard -n kube-system
-
-# Expose dashboard as NodePort
-kubectl patch svc kubernetes-dashboard -n kube-system -p '{"spec":{"type":"NodePort","ports":[{"port":443,"targetPort":8443,"nodePort":30443}]}}'
-
-DASHBOARD_TOKEN=$(kubectl describe secret -n kube-system microk8s-dashboard-token | grep "token:" | awk '{print $2}')
-echo "$DASHBOARD_TOKEN" > ~/.kube/dashboard-token
-chmod 600 ~/.kube/dashboard-token
-if [ "$(id -u)" -eq 0 ]; then
-    chown $USER:$USER ~/.kube/dashboard-token
+if command -v helm &>/dev/null; then
+    skip "helm is installed"
+else
+    echo -e "${YELLOW}  ▶ curl ... | bash (helm installer)${NC}"
+    curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 fi
-echo "✓ Kubernetes Dashboard ready on NodePort 30443"
 
-# Install monitoring stack (Prometheus + Grafana)
-echo ""
-echo "Installing monitoring stack (Prometheus + Grafana)..."
+validate "helm works" "helm version --short &>/dev/null"
+
+# =============================================================================
+# Step 8: k9s (optional; non-fatal)
+# =============================================================================
+step "Install k9s (optional)"
+
+if command -v k9s &>/dev/null; then
+    skip "k9s is installed"
+else
+    if wget -q --timeout=15 https://github.com/derailed/k9s/releases/latest/download/k9s_Linux_amd64.tar.gz -O /tmp/k9s_Linux_amd64.tar.gz 2>/dev/null; then
+        tar -xzf /tmp/k9s_Linux_amd64.tar.gz -C /tmp
+        sudo chmod +x /tmp/k9s
+        sudo mv /tmp/k9s /usr/local/bin/
+        rm -f /tmp/k9s_Linux_amd64.tar.gz /tmp/LICENSE /tmp/README.md 2>/dev/null || true
+        echo -e "${GREEN}  ✓ k9s installed${NC}"
+    else
+        echo -e "${YELLOW}  ⚠ k9s download failed, skipping (not required for tutorial)${NC}"
+    fi
+fi
+
+# =============================================================================
+# Step 9: uv (Python tooling used by notebooks)
+# =============================================================================
+step "Install uv"
+
+# Newer uv installs to ~/.local/bin; older installers used ~/.cargo/bin.
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+
+if command -v uv &>/dev/null; then
+    skip "uv is installed ($(command -v uv))"
+else
+    echo -e "${YELLOW}  ▶ curl ... | sh (uv installer)${NC}"
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+    fix_owner "$HOME/.local" "$HOME/.cargo" 2>/dev/null || true
+fi
+
+if command -v uv &>/dev/null; then
+    echo -e "${GREEN}  ✓ uv at $(command -v uv)${NC}"
+else
+    echo -e "${YELLOW}  ⚠ uv not found on PATH after install, continuing${NC}"
+fi
+
+# =============================================================================
+# Step 10: local-path storage provisioner
+# =============================================================================
+step "Install local-path storage provisioner"
+
+if kubectl get deployment local-path-provisioner -n local-path-storage &>/dev/null; then
+    skip "local-path-provisioner deployed"
+else
+    run kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.24/deploy/local-path-storage.yaml
+    echo -e "${YELLOW}  ▶ Waiting for provisioner...${NC}"
+    kubectl wait --for=condition=available --timeout=60s deployment/local-path-provisioner -n local-path-storage
+fi
+
+if kubectl get storageclass local-path -o jsonpath='{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}' 2>/dev/null | grep -q "true"; then
+    skip "local-path is default storage class"
+else
+    run kubectl patch storageclass local-path -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+fi
+
+validate "storage class exists" "kubectl get storageclass local-path &>/dev/null"
+
+# =============================================================================
+# Step 11: Prometheus + Grafana (keep dashboard sidecars for Lab 2 ConfigMaps)
+# =============================================================================
+step "Install Prometheus + Grafana"
 
 kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
 
-echo "Adding Helm repos for monitoring..."
-helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-helm repo update
+if helm repo list 2>/dev/null | grep -q prometheus-community; then
+    skip "prometheus-community helm repo"
+else
+    run helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+fi
+run helm repo update
 
+# Write values even on re-run so upgrades pick up current settings.
+# Use a quoted heredoc + placeholder so password generation cannot break YAML.
 if command -v openssl >/dev/null 2>&1; then
     GRAFANA_ADMIN_PASSWORD=$(openssl rand -base64 18 | tr -d '=+/')
 else
     GRAFANA_ADMIN_PASSWORD="admin-$(date +%s)"
 fi
 
-cat <<EOF >/tmp/kube-prometheus-stack-values.yaml
+cat <<'VALEOF' | sed "s/__GRAFANA_PASSWORD__/${GRAFANA_ADMIN_PASSWORD}/" >/tmp/kube-prometheus-stack-values.yaml
 grafana:
   enabled: true
-  adminPassword: "${GRAFANA_ADMIN_PASSWORD}"
+  adminPassword: "__GRAFANA_PASSWORD__"
   grafana.ini:
     auth:
       disable_login_form: true
@@ -206,42 +365,50 @@ grafana:
     dashboards:
       enabled: true
       label: grafana_dashboard
-      searchNamespace: monitoring
+      searchNamespace: ALL
       env:
         SKIP_TLS_VERIFY: "true"
     datasources:
       enabled: true
       env:
         SKIP_TLS_VERIFY: "true"
-EOF
+VALEOF
 
-echo "Installing kube-prometheus-stack..."
+if helm list -n monitoring 2>/dev/null | grep -q kube-prometheus-stack; then
+    echo -e "${YELLOW}  ▶ helm upgrade kube-prometheus-stack (existing release)${NC}"
+else
+    echo -e "${YELLOW}  ▶ helm install kube-prometheus-stack (this takes several minutes)${NC}"
+fi
+
 MAX_RETRIES=3
 RETRY_COUNT=0
-
-while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+while [ "$RETRY_COUNT" -lt "$MAX_RETRIES" ]; do
     if helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
         -n monitoring \
         -f /tmp/kube-prometheus-stack-values.yaml \
         --wait \
         --timeout 10m; then
-        echo "✓ kube-prometheus-stack installed successfully"
+        echo -e "${GREEN}  ✓ kube-prometheus-stack installed/upgraded${NC}"
         break
     else
         RETRY_COUNT=$((RETRY_COUNT + 1))
-        if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-            echo "⚠️  Helm install failed (attempt $RETRY_COUNT/$MAX_RETRIES), retrying in 10 seconds..."
+        if [ "$RETRY_COUNT" -lt "$MAX_RETRIES" ]; then
+            echo -e "${YELLOW}  ⚠ Helm install failed (attempt $RETRY_COUNT/$MAX_RETRIES), retrying in 10s...${NC}"
             sleep 10
         else
-            echo "❌ Helm install failed after $MAX_RETRIES attempts"
-            echo "   You can retry manually with:"
-            echo "   helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack -n monitoring -f /tmp/kube-prometheus-stack-values.yaml --wait --timeout 10m"
+            echo -e "${RED}  ✗ Helm install failed after $MAX_RETRIES attempts${NC}"
+            echo "    Retry manually with:"
+            echo "    helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack -n monitoring -f /tmp/kube-prometheus-stack-values.yaml --wait --timeout 10m"
             exit 1
         fi
     fi
 done
 
-echo "Provisioning Grafana dashboards..."
+# =============================================================================
+# Step 12: Grove dashboards via ConfigMaps (sidecar auto-loads them for Lab 2)
+# =============================================================================
+step "Provision Grafana dashboard ConfigMaps"
+
 kubectl apply -n monitoring -f - <<'EOF'
 apiVersion: v1
 kind: ConfigMap
@@ -477,84 +644,81 @@ data:
     }
 EOF
 
-# Wait for Grafana to be ready
-kubectl wait --for=condition=available --timeout=180s deployment/kube-prometheus-stack-grafana -n monitoring
-
-echo "✓ Grove dashboards pre-configured in Grafana"
-echo "  (NATS and etcd will be installed in Lab 3)"
-
-# Final permission fix for any files created by microk8s
-if [ "$(id -u)" -eq 0 ] && [ -d "$HOME/.kube" ]; then
-    chown -R $USER:$USER "$HOME/.kube" 2>/dev/null || true
+# Wait for the Grafana Deployment; do not hard-fail on HTTP health (NodePort /
+# InternalIP reachability varies on Brev).
+if kubectl wait --for=condition=available --timeout=180s deployment/kube-prometheus-stack-grafana -n monitoring; then
+    echo -e "${GREEN}  ✓ Grafana deployment available${NC}"
+else
+    echo -e "${YELLOW}  ⚠ Grafana deployment not ready within timeout; check: kubectl get pods -n monitoring${NC}"
 fi
 
-# Verify (without sudo - should work now!)
+echo -e "${GREEN}  ✓ Grove dashboards ConfigMaps applied (sidecar loads them for Lab 2)${NC}"
+echo "    (NATS and etcd panels populate once Lab 3 installs those components)"
+
+# Final permission fix for any files created while running as root
+if [ "$(id -u)" -eq 0 ] && [ -d "$HOME/.kube" ]; then
+    chown -R "$USER:$USER" "$HOME/.kube" 2>/dev/null || true
+fi
+
+# =============================================================================
+# Summary
+# =============================================================================
+NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true)
+
 echo ""
 echo "Verifying installation..."
-sudo microk8s status
+sudo microk8s status || true
 
-# Show which binaries we're using
 echo ""
-echo "kubectl binary: $(which kubectl)"
-echo "helm binary: $(which helm)"
+echo "kubectl binary: $(command -v kubectl)"
+echo "helm binary:    $(command -v helm)"
+echo "k9s binary:     $(command -v k9s 2>/dev/null || echo 'not installed')"
+echo "uv binary:      $(command -v uv 2>/dev/null || echo 'not installed')"
 
-# Test kubectl
-export KUBECONFIG=$HOME/.kube/config
-kubectl version --client
+export KUBECONFIG="$HOME/.kube/config"
+kubectl version --client || true
 echo ""
 echo "Testing cluster access..."
 kubectl get nodes 2>/dev/null && echo "✓ kubectl can access cluster without group membership!" || echo "⚠️  kubectl will work after sourcing shell config"
 
-# Test helm
 echo ""
 echo "Testing helm..."
 helm version --short 2>/dev/null && echo "✓ helm is ready!" || echo "⚠️  helm will work after sourcing shell config"
 
-# Verify storage class
 echo ""
 echo "Verifying storage class..."
-kubectl get storageclass
+kubectl get storageclass || true
 
 echo ""
-echo "✅ Kubernetes ready for Dynamo!"
+echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${GREEN}  ✅ Kubernetes ready for Dynamo!${NC}"
+echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 echo "Kubeconfig: ~/.kube/config"
 echo ""
-echo "Quick start (works immediately!):"
+echo "Quick start:"
 echo "  kubectl get nodes"
 echo "  kubectl get pods -A"
 echo "  kubectl get storageclass"
 echo "  helm version"
 echo "  k9s"
 echo ""
-echo "💡 How it works:"
-echo "  - kubectl, helm, k9s are standalone binaries (/usr/local/bin/)"
-echo "  - uv (fast Python package installer) installed to ~/.cargo/bin/"
-echo "  - Use ~/.kube/config automatically"
-echo "  - Storage provisioner ready for Dynamo PVCs"
-echo "  - Grafana available via NodePort on 30080"
-echo "  - No group membership needed!"
-echo "  - No 'newgrp' or logout required!"
-echo ""
-echo "Grafana access:"
-echo "  URL: http://<node-ip>:30080"
-echo "  Anonymous access enabled (no login required)"
-echo "  Hint: get node IPs with 'kubectl get nodes -o wide'"
-echo ""
-echo "Grove (Lab 3):"
-echo "  Dashboards pre-configured: NATS Overview, etcd Overview"
-echo "  Components will be installed when you run Lab 3"
+echo "Grafana:"
+if [ -n "${NODE_IP:-}" ]; then
+    echo "  URL: http://${NODE_IP}:30080"
+else
+    echo "  URL: http://<node-ip>:30080"
+fi
+echo "  Anonymous access enabled as Viewer (no login required)"
+echo "  Hint: kubectl get nodes -o wide"
 echo ""
 echo "Next steps:"
-echo "  1. Set up NGC authentication (required for Dynamo container images):"
-echo "     Get your NGC API key from: https://ngc.nvidia.com/"
-echo "     Then run: helm registry login nvcr.io"
+echo "  1. NGC auth for Dynamo images:"
+echo "     helm registry login nvcr.io"
 echo "     Username: \$oauthtoken"
-echo "     Password: <your NGC API key>"
+echo "     Password: <NGC API key from https://ngc.nvidia.com/>"
 echo ""
 echo "  2. Start the guides:"
 echo "     jupyter lab"
 echo "     Then open: 01-dynamo-deployment-guide.ipynb"
-echo ""
-echo "  3. Or browse the README.md for detailed information"
 echo ""
