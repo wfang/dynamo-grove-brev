@@ -376,7 +376,7 @@ grafana:
       root_url: ""
   service:
     type: NodePort
-    nodePort: 30080
+    nodePort: 31080
   sidecar:
     dashboards:
       enabled: true
@@ -677,6 +677,26 @@ if [ "$(id -u)" -eq 0 ] && [ -d "$HOME/.kube" ]; then
 fi
 
 # =============================================================================
+# Step 13: Grafana port-forward service (Brev app proxy expects host port 30080)
+# =============================================================================
+# The Brev apps.run.brev.nvidia.com proxy connects to the instance on port 30080.
+# microk8s kube-proxy iptables rules intercept NodePort traffic before it reaches
+# any user-space process, so Grafana's NodePort is set to 31080 above to free
+# port 30080. We then run a kubectl port-forward on 30080 that Pomerium can reach.
+step "Install Grafana port-forward service"
+
+if systemctl is-active grafana-portforward &>/dev/null; then
+    skip "grafana-portforward service already running"
+else
+    printf '[Unit]\nDescription=Port-forward Grafana to host port 30080\nAfter=network.target\n\n[Service]\nUser=%s\nExecStart=/usr/local/bin/kubectl port-forward svc/kube-prometheus-stack-grafana 30080:80 -n monitoring --address 0.0.0.0\nEnvironment=KUBECONFIG=%s/.kube/config\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n' "$USER" "$HOME" \
+        | sudo tee /etc/systemd/system/grafana-portforward.service > /dev/null
+    sudo systemctl daemon-reload
+    run sudo systemctl enable --now grafana-portforward
+fi
+
+validate "Grafana reachable on port 30080" "curl -s -o /dev/null -w '%{http_code}' http://localhost:30080/api/health | grep -q 200"
+
+# =============================================================================
 # Summary
 # =============================================================================
 NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true)
@@ -720,13 +740,15 @@ echo "  helm version"
 echo "  k9s"
 echo ""
 echo "Grafana:"
+echo "  Brev URL: https://grafana-\$(hostname | sed 's/brev-//').apps.run.brev.nvidia.com/"
 if [ -n "${NODE_IP:-}" ]; then
-    echo "  URL: http://${NODE_IP}:30080"
+    echo "  Direct:   http://${NODE_IP}:31080"
 else
-    echo "  URL: http://<node-ip>:30080"
+    echo "  Direct:   http://<node-ip>:31080"
 fi
 echo "  Anonymous access enabled as Viewer (no login required)"
-echo "  Hint: kubectl get nodes -o wide"
+echo "  Note: port 30080 is the Brev proxy target (port-forward service)"
+echo "        port 31080 is the raw NodePort for direct access"
 echo ""
 echo "Next steps:"
 echo "  1. NGC auth for Dynamo images:"
