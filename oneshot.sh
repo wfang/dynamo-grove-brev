@@ -93,7 +93,7 @@ if [ "$(id -u)" -eq 0 ] || [ "${USER:-}" = "root" ]; then
     export HOME="/home/$DETECTED_USER"
 fi
 
-export RELEASE_VERSION="${RELEASE_VERSION:-0.7.1}"
+export RELEASE_VERSION="${RELEASE_VERSION:-1.5.0}"
 export NAMESPACE="${NAMESPACE:-dynamo}"
 export CACHE_PATH="${CACHE_PATH:-/data/huggingface-cache}"
 
@@ -211,7 +211,7 @@ for shell_config in "$HOME/.bashrc" "$HOME/.zshrc"; do
         cat >> "$shell_config" <<'DYNAMO_ENV'
 
 # NVIDIA Dynamo configuration
-export RELEASE_VERSION="0.7.1"
+export RELEASE_VERSION="1.5.0"
 export NAMESPACE="dynamo"
 export CACHE_PATH="/data/huggingface-cache"
 DYNAMO_ENV
