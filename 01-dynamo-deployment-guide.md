@@ -47,7 +47,7 @@ Run this to set up your environment. The defaults work for most users:
 
 ```bash
 # Set environment variables (these defaults work for most setups)
-export RELEASE_VERSION=${RELEASE_VERSION:-0.8.0}
+export RELEASE_VERSION=${RELEASE_VERSION:-0.9.1}
 export NAMESPACE=${NAMESPACE:-dynamo}
 export CACHE_PATH=${CACHE_PATH:-/data/huggingface-cache}
 
@@ -217,7 +217,7 @@ echo "✓ HuggingFace token secret created"
 - Install Dynamo platform (operator with K8s-native discovery)
 - Verify platform components are running
 
-### Architecture (v0.8.0 Simplified)
+### Architecture (v0.9.1 Simplified)
 
 ```
 Client Request
@@ -256,7 +256,7 @@ We're using the **recommended cluster-wide deployment** (default). According to 
 
 ```bash
 # Set default RELEASE_VERSION if not already set
-export RELEASE_VERSION=${RELEASE_VERSION:-0.8.0}
+export RELEASE_VERSION=${RELEASE_VERSION:-0.9.1}
 
 # Check if CRDs already exist, install if not
 if kubectl get crd dynamographdeployments.nvidia.com &>/dev/null && \
@@ -278,12 +278,12 @@ fi
 
 ### Step 2: Install Dynamo Platform
 
-**Simplified in v0.8.0:** NATS and etcd are now **optional**. Dynamo uses Kubernetes-native service discovery (EndpointSlices) and TCP transport by default, making deployment simpler and reducing infrastructure dependencies.
+**Simplified in v0.9.1:** NATS and etcd are now **optional**. Dynamo uses Kubernetes-native service discovery (EndpointSlices) and TCP transport by default, making deployment simpler and reducing infrastructure dependencies.
 
 
 ```bash
 # Set defaults if not already set
-export RELEASE_VERSION=${RELEASE_VERSION:-0.8.0}
+export RELEASE_VERSION=${RELEASE_VERSION:-1.5.0}
 export NAMESPACE=${NAMESPACE:-dynamo}
 
 echo "Using configuration:"
@@ -306,7 +306,7 @@ helm install dynamo-platform \
 echo ""
 echo "✓ Platform installation initiated"
 echo "  Discovery: Kubernetes EndpointSlices (native)"
-echo "  Transport: TCP (default in v0.8.0)"
+echo "  Transport: TCP (default in v0.9.1)"
 echo ""
 echo "Waiting for pods to be ready..."
 ```
@@ -422,7 +422,7 @@ We will create the `disagg_router.yaml` file dynamically with your specific conf
 
 ```bash
 # Set defaults if not already set
-export RELEASE_VERSION=${RELEASE_VERSION:-0.8.0}
+export RELEASE_VERSION=${RELEASE_VERSION:-0.9.1}
 export CACHE_PATH=${CACHE_PATH:-/data/huggingface-cache}
 
 # Create the deployment YAML with environment variables
@@ -932,9 +932,9 @@ kubectl get events -n $NAMESPACE --sort-by=.lastTimestamp | tail -20
 
 ---
 
-## Known Issues (v0.8.0)
+## Known Issues (v0.9.1)
 
-**⚠️ Important Notes for Dynamo v0.8.0:**
+**⚠️ Important Notes for Dynamo v0.9.1:**
 
 1. **Validation Webhook Timing**: In rare cases, validation webhooks may reject valid configurations during high cluster load. If deployment fails with validation errors, wait 30 seconds and retry.
 
@@ -1042,7 +1042,7 @@ kubectl cluster-info
 
 # Set your configuration
 export NAMESPACE="dynamo"
-export RELEASE_VERSION="0.8.0"     # Dynamo version
+export RELEASE_VERSION="0.9.1"     # Dynamo version
 export HF_TOKEN="your_hf_token"    # Your HuggingFace token
 export CACHE_PATH="/data/huggingface-cache"  # Shared cache path
 
