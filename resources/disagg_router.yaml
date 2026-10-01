@@ -16,7 +16,7 @@ spec:
       replicas: 1
       extraPodSpec:
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.7.1
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.5.0
       envs:
         - name: DYN_ROUTER_MODE
           value: disaggregated
@@ -38,7 +38,7 @@ spec:
             path: /data/huggingface-cache  # Will be updated with actual cache path
             type: DirectoryOrCreate
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.7.1
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.5.0
           securityContext:
             capabilities:
               add:
@@ -70,7 +70,7 @@ spec:
             path: /data/huggingface-cache  # Will be updated with actual cache path
             type: DirectoryOrCreate
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.7.1
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.5.0
           securityContext:
             capabilities:
               add:
